@@ -13,15 +13,16 @@ use Doctrine\ORM\EntityManager;
 use phpBB\SessionsAuthBundle\Authentication\Provider\phpBBUserProvider;
 use phpBB\SessionsAuthBundle\Entity\Session;
 use phpBB\SessionsAuthBundle\Tokens\phpBBToken;
-use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\RequestStack;
-use Symfony\Component\Security\Http\Authentication\SimplePreAuthenticatorInterface;
+use Symfony\Component\Security\Core\Authentication\Token\AnonymousToken;
 use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
 use Symfony\Component\Security\Core\Exception\AuthenticationException;
+use Symfony\Component\Security\Core\Exception\CustomUserMessageAuthenticationException;
 use Symfony\Component\Security\Core\User\UserProviderInterface;
 use Symfony\Component\Security\Http\Authentication\AuthenticationFailureHandlerInterface;
+use Symfony\Component\Security\Http\Authentication\SimplePreAuthenticatorInterface;
 
 class phpBBSessionAuthenticator implements SimplePreAuthenticatorInterface, AuthenticationFailureHandlerInterface
 {
@@ -39,28 +40,54 @@ class phpBBSessionAuthenticator implements SimplePreAuthenticatorInterface, Auth
     /** @var RequestStack  */
     private $requestStack;
 
-    /** @var ContainerInterface  */
-    private $container;
+    /**
+     * entityManager
+     *
+     * @var EntityManager
+     */
+    private $entityManager;
 
-    /** @var  string */
-    private $dbConnection;
+    /**
+     * forceLogin
+     *
+     * @var bool
+     */
+    private $forceLogin;
+
+    /**
+     * secret
+     *
+     * @var string
+     */
+    private $secret;
 
     /**
      * @param $cookiename string
      * @param $boardurl  string
      * @param $loginpage string
+     * @param $forceLogin boolean
+     * @param $secret string
      * @param $requestStack RequestStack
-     * @param ContainerInterface $container
      */
-    public function __construct($cookiename, $boardurl, $loginpage, $dbconnection,
-                                RequestStack $requestStack, ContainerInterface $container)
+    public function __construct(
+        $cookiename,
+        $boardurl,
+        $loginpage,
+        $forceLogin,
+        $secret,
+        RequestStack $requestStack
+    ) {
+        $this->cookieName    = $cookiename;
+        $this->boardUrl      = $boardurl;
+        $this->loginPage     = $loginpage;
+        $this->requestStack  = $requestStack;
+        $this->forceLogin    = $forceLogin;
+        $this->secret        = $secret;
+    }
+
+    public function setEntityManager(EntityManager $entityManager)
     {
-        $this->cookieName   = $cookiename;
-        $this->boardUrl     = $boardurl;
-        $this->loginPage    = $loginpage;
-        $this->dbConnection = $dbconnection;
-        $this->requestStack = $requestStack;
-        $this->container    = $container;
+        $this->entityManager = $entityManager;
     }
 
     /**
@@ -81,63 +108,25 @@ class phpBBSessionAuthenticator implements SimplePreAuthenticatorInterface, Auth
             );
         }
 
-        $sessionId = $this->requestStack->getCurrentRequest()->cookies->get($this->cookieName . '_sid');
-        $userId    = $this->requestStack->getCurrentRequest()->cookies->get($this->cookieName . '_u');
+        $request = $this->requestStack->getCurrentRequest();
 
-        if (empty($sessionId))
+        $sessionId = $request->cookies->get($this->cookieName . '_sid');
+        $expectedUserId = $request->cookies->get($this->cookieName . '_u');
+
+        $username = $userProvider->getUsernameForSessionId($sessionId, $expectedUserId, $request->getClientIp());
+
+        if (!$username)
         {
-            return null; // We can't authenticate if no SID is available.
+            return $this->createAnonymousToken($providerKey); // We can't authenticate if no SID is available.
         }
 
-        /** @var EntityManager $em */
-        $em = $this->container->get('doctrine')->getManager($this->dbConnection);
+        $user = $userProvider->loadUserByUsername($username);
 
-        /** @var Session $session */
-        $session = $em->getRepository('phpbbSessionsAuthBundle:Session')->findById($sessionId);
+        // We have a valid user, which is not the guest user.
+        $roles = ['ROLE_PHPBB_USER'];
+        $token = new phpBBToken($user, $providerKey, $roles);
 
-
-        if (!$session ||
-            $session->getUser() == null ||
-            ($session->getUser() != null && $session->getUser()->getId() == self::ANONYMOUS) ||
-            $session->getUser()->getId() != $userId)
-        {
-            return null;
-        }
-
-        $userIp = $this->requestStack->getCurrentRequest()->getClientIp();
-
-        if (strpos($userIp, ':') !== false && strpos($session->getIp(), ':') !== false)
-        {
-            $s_ip = $this->shortIpv6($session->getIp(), 3);
-            $u_ip = $this->shortIpv6($userIp, 3);
-        }
-        else
-        {
-            $s_ip = implode('.', array_slice(explode('.', $session->getIp()), 0, 3));
-            $u_ip = implode('.', array_slice(explode('.', $userIp), 0, 3));
-        }
-
-        // Assume session length of 3600
-        if ($u_ip === $s_ip && $session->getTime() < time() - 3600 + 60)
-        {
-            // We have a valid user, which is not the guest user.
-
-            $roles = array();
-
-            if ($session->getUser()->isBot()) {
-                $roles[] = 'ROLE_BOT';
-            }
-            else
-            {
-
-            }
-
-            $token = new phpBBToken($session->getUser(), $providerKey, $roles);
-
-            return $token;
-        }
-        return null;
-
+        return $token;
     }
 
     /**
@@ -169,46 +158,17 @@ class phpBBSessionAuthenticator implements SimplePreAuthenticatorInterface, Auth
      */
     public function onAuthenticationFailure(Request $request, AuthenticationException $exception)
     {
-        return new RedirectResponse($this->boardUrl . $this->loginPage);
+        if ($this->forceLogin) {
+            return new RedirectResponse($this->boardUrl . $this->loginPage);
+        }
     }
 
-    /**
-     * Returns the first block of the specified IPv6 address and as many additional
-     * ones as specified in the length paramater.
-     * If length is zero, then an empty string is returned.
-     * If length is greater than 3 the complete IP will be returned
-     *
-     * @copyright (c) phpBB Limited <https://www.phpbb.com>
-     * @license GNU General Public License, version 2 (GPL-2.0)
-     *
-     * @param $ip
-     * @param $length
-     * @return mixed|string
-     */
-    private function shortIpv6($ip, $length)
+    private function createAnonymousToken($providerKey)
     {
-        if ($length < 1)
-        {
-            return '';
+        if ($this->forceLogin) {
+            throw new CustomUserMessageAuthenticationException('can not authenticate user via phpbb');
         }
 
-        // extend IPv6 addresses
-        $blocks = substr_count($ip, ':') + 1;
-        if ($blocks < 9)
-        {
-            $ip = str_replace('::', ':' . str_repeat('0000:', 9 - $blocks), $ip);
-        }
-        if ($ip[0] == ':')
-        {
-            $ip = '0000' . $ip;
-        }
-        if ($length < 4)
-        {
-            $ip = implode(':', array_slice(explode(':', $ip), 0, 1 + $length));
-        }
-
-        return $ip;
+        return new AnonymousToken($this->secret, 'anon.');
     }
-
 }
-
